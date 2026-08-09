@@ -151,7 +151,7 @@ async def _cmd_heartbeat() -> None:
     On each tick: check Zulip for new messages, process one if available,
     and write state.
     """
-    state_dir = Path.home() / ".prime" / "zulip"
+    state_dir = Path.home() / ".config" / "prime-zulip"
     state_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_dir / "state.json"
 
