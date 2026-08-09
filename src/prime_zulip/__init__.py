@@ -1,0 +1,26 @@
+"""
+Prime Agent Zulip Bridge — persistent chat integration for Prime Agent sessions.
+
+Provides a lightweight async bridge that connects a Prime Agent to a Zulip
+organization via the Zulip Events API. Agents receive DMs and stream @mentions
+and reply with full Markdown, code blocks, images, and reactions.
+
+Usage:
+    from prime_zulip import PrimeZulipBridge
+
+    bridge = PrimeZulipBridge(
+        site="https://chat.happyvertical.com",
+        email="cricket@happyvertical.com",
+        api_key="...",
+        allowed_user_ids={8},
+    )
+
+    async with bridge:
+        async for event in bridge.events():
+            await bridge.reply(event, "Got it!")
+"""
+
+from .bridge import PrimeZulipBridge, ZulipEvent, ZulipMessage
+from .auth import Allowlist
+
+__all__ = ["PrimeZulipBridge", "ZulipEvent", "ZulipMessage", "Allowlist"]
