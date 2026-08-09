@@ -21,7 +21,18 @@ from . import PrimeZulipBridge, ZulipEvent
 
 
 def _env_config() -> dict[str, Any]:
-    """Load bridge config from environment variables."""
+    """Load bridge config from environment variables and config file."""
+    # Try config file first
+    config_file = Path.home() / ".config" / "prime-zulip" / "env"
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            if "=" in line:
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and val and key not in os.environ:
+                    os.environ[key] = val
+
     site = os.environ.get("ZULIP_SITE", os.environ.get("ZULIP_SITE_URL", ""))
     email = os.environ.get("ZULIP_EMAIL", os.environ.get("ZULIP_BOT_EMAIL", ""))
     api_key = os.environ.get("ZULIP_API_KEY", "")
