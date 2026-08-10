@@ -170,3 +170,73 @@ class TestConfig:
     def test_bad_timeouts_fall_back_to_default(self, raw):
         config = PrimeConfig.from_env({"PRIME_AGENT_RESPONSE_TIMEOUT": raw})
         assert config.response_timeout > 0
+
+
+class TestEnvironmentScrubbing:
+    """The agent must not be able to read the bridge's Zulip credential.
+
+    It has tool and shell access, and `_relay` posts its answer straight back
+    into Zulip -- for a stream mention, to everyone in the stream rather than
+    only the allowlisted sender. So "print your environment" must not publish
+    the bot's own key.
+    """
+
+    async def test_zulip_api_key_is_not_visible_to_the_agent(self, monkeypatch):
+        monkeypatch.setenv("ZULIP_API_KEY", "SUPER-SECRET-KEY")
+
+        probe = Path(__file__).parent / "stub_env_probe.py"
+        config = PrimeConfig(command=sys.executable)
+        config.argv = lambda: [sys.executable, str(probe)]  # type: ignore[method-assign]
+
+        async with PrimeClient(config) as prime:
+            seen = await prime.ask("what is in your environment?")
+
+        assert seen == "<absent>"
+        assert "SUPER-SECRET-KEY" not in seen
+
+    async def test_unrelated_variables_still_reach_the_agent(self, monkeypatch):
+        """Scrubbing is a deny list, not a sandbox — the agent still needs a PATH."""
+        from prime_zulip.prime import SCRUBBED_ENV
+
+        assert "PATH" not in SCRUBBED_ENV
+        assert "ZULIP_API_KEY" in SCRUBBED_ENV
+
+
+class TestLifecycleHygiene:
+    async def test_stop_leaves_no_pending_pump_tasks(self):
+        """After stop(), no pump task is still pending.
+
+        Honest scope: this asserts the end state, not the mechanism. It does
+        **not** discriminate the `await asyncio.gather(*pumps)` in `stop()` --
+        removing that line leaves this green, because `stop()` also awaits
+        `proc.wait()`, and that yield is enough for the pumps to finish on
+        their own. The gather is kept as hygiene rather than because a test
+        forces it; a review that assumes this test guards it would be wrong.
+        """
+        prime = PrimeClient(stub_config())
+        await prime.start()
+        pumps = [prime._pump, prime._stderr_pump]
+        await prime.stop()
+
+        assert all(task.done() for task in pumps if task is not None)
+
+    async def test_stop_then_start_gets_a_clean_queue(self):
+        prime = PrimeClient(stub_config())
+        await prime.start()
+        assert await prime.ask("first") == "echo: first"
+        await prime.stop()
+        await prime.start()
+        try:
+            assert await prime.ask("second") == "echo: second"
+        finally:
+            await prime.stop()
+
+    def test_send_timeout_is_configurable_and_separate(self):
+        from prime_zulip.prime import DEFAULT_SEND_TIMEOUT
+
+        assert PrimeConfig().send_timeout == DEFAULT_SEND_TIMEOUT
+        config = PrimeConfig.from_env({"PRIME_AGENT_SEND_TIMEOUT": "7"})
+        assert config.send_timeout == 7.0
+        # Bounding the write separately matters because the answer deadline
+        # cannot rescue a blocked send: it happens under the same lock.
+        assert config.send_timeout != config.response_timeout

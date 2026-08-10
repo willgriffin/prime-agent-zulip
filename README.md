@@ -166,10 +166,17 @@ no bypass.
 | `PRIME_AGENT_SESSION_DIR` | No | Custom session storage directory |
 | `PRIME_AGENT_NO_SESSION` | No | Set truthy to disable session persistence |
 | `PRIME_AGENT_START_TIMEOUT` | No | Seconds to allow for startup (default 30) |
+| `PRIME_AGENT_SEND_TIMEOUT` | No | Seconds to allow for writing a prompt (default 30) |
 | `PRIME_AGENT_RESPONSE_TIMEOUT` | No | Seconds to allow per answer (default 600) |
 
-No credential is ever placed in the agent's argv — secrets reach it through
-the inherited environment, because argv is world-readable via `/proc`.
+No credential is ever placed in the agent's argv — argv is world-readable via
+`/proc`. What the agent needs reaches it through the inherited environment.
+
+`ZULIP_API_KEY` is **stripped** from that environment before launch. The agent
+has tool and shell access and its answers are relayed verbatim into Zulip, so
+leaving the bot's own credential reachable would mean "print your environment"
+publishes it to the chat — and for a stream mention, to everyone in the stream
+rather than only the allowlisted sender. Nothing in prime-agent needs it.
 
 ## How the Prime integration works
 

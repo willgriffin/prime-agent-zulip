@@ -38,6 +38,21 @@ DEFAULT_COMMAND = "prime-agent"
 DEFAULT_START_TIMEOUT = 30.0
 DEFAULT_RESPONSE_TIMEOUT = 600.0
 
+# Bounded separately from the answer: a write that blocks is a stuck reader on
+# the far end, and the answer timeout cannot rescue it because the send happens
+# under the same lock every later prompt queues on.
+DEFAULT_SEND_TIMEOUT = 30.0
+
+# Stripped from the agent's environment before launch.
+#
+# The agent has tool and shell access and its output is relayed verbatim back
+# into Zulip -- and for a stream mention that reply is visible to everyone in
+# the stream, not just the allowlisted sender. So the bot's own Zulip
+# credential must not be reachable from inside it: "print your environment"
+# would otherwise publish the key to chat. Nothing in prime-agent needs it;
+# the bridge is the only Zulip client here.
+SCRUBBED_ENV = frozenset({"ZULIP_API_KEY"})
+
 # Read chunk for the stdout pump. Assistant turns are far larger than a line,
 # so this is a throughput knob, not a correctness one.
 _READ_CHUNK = 65536
@@ -61,6 +76,7 @@ class PrimeConfig:
     session_dir: str | None = None
     no_session: bool = False
     start_timeout: float = DEFAULT_START_TIMEOUT
+    send_timeout: float = DEFAULT_SEND_TIMEOUT
     response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
     env: dict[str, str] = field(default_factory=dict)
 
@@ -68,9 +84,9 @@ class PrimeConfig:
     def from_env(cls, environ: dict[str, str] | None = None) -> PrimeConfig:
         """Build a config from ``PRIME_*`` environment variables.
 
-        No secret is ever placed in argv -- anything sensitive reaches the
-        agent through the inherited environment, which is why `env` is merged
-        over `os.environ` rather than replacing it.
+        No secret is ever placed in argv. What the agent does need reaches it
+        through the inherited environment -- minus everything in
+        :data:`SCRUBBED_ENV`, which the launch strips before exec.
         """
         src = os.environ if environ is None else environ
 
@@ -84,6 +100,7 @@ class PrimeConfig:
             session_dir=src.get("PRIME_AGENT_SESSION_DIR") or None,
             no_session=_truthy(src.get("PRIME_AGENT_NO_SESSION", "")),
             start_timeout=_float(src.get("PRIME_AGENT_START_TIMEOUT"), DEFAULT_START_TIMEOUT),
+            send_timeout=_float(src.get("PRIME_AGENT_SEND_TIMEOUT"), DEFAULT_SEND_TIMEOUT),
             response_timeout=_float(
                 src.get("PRIME_AGENT_RESPONSE_TIMEOUT"), DEFAULT_RESPONSE_TIMEOUT
             ),
@@ -140,7 +157,8 @@ class PrimeClient:
                 "set PRIME_AGENT_BIN to an absolute path"
             )
 
-        env = {**os.environ, **self.config.env}
+        env = {k: v for k, v in os.environ.items() if k not in SCRUBBED_ENV}
+        env.update(self.config.env)
 
         logger.info("starting prime-agent: %s", " ".join(argv))
         try:
@@ -163,9 +181,9 @@ class PrimeClient:
         """Close stdin so the agent exits on EOF, then reap it."""
         proc, self._proc = self._proc, None
 
-        for task in (self._pump, self._stderr_pump):
-            if task is not None:
-                task.cancel()
+        pumps = [t for t in (self._pump, self._stderr_pump) if t is not None]
+        for task in pumps:
+            task.cancel()
         self._pump = self._stderr_pump = None
 
         if proc is not None and proc.returncode is None:
@@ -182,6 +200,13 @@ class PrimeClient:
                 logger.warning("prime-agent ignored EOF; killing")
                 proc.kill()
                 await proc.wait()
+
+        # Await the cancellations rather than merely requesting them. Leaving
+        # them pending both produces "Task was destroyed but it is pending"
+        # noise and means a later start() could install a fresh queue while a
+        # previous-generation pump is still technically alive.
+        if pumps:
+            await asyncio.gather(*pumps, return_exceptions=True)
 
         self._events = None
         logger.info("prime-agent stopped")
@@ -208,7 +233,15 @@ class PrimeClient:
 
         self._counter += 1
         request_id = f"zulip-{self._counter}"
-        await self._send({"id": request_id, "type": "prompt", "message": message})
+        try:
+            await asyncio.wait_for(
+                self._send({"id": request_id, "type": "prompt", "message": message}),
+                timeout=self.config.send_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise PrimeError(
+                f"prime-agent did not accept input within {self.config.send_timeout:.0f}s"
+            ) from None
 
         parts: list[str] = []
         deadline = asyncio.get_running_loop().time() + self.config.response_timeout
@@ -284,8 +317,12 @@ class PrimeClient:
         not protocol-compliant, and Python's text-mode line iteration
         additionally rewrites bare CR. Bytes in, LF out.
         """
+        # Bind to this generation's process *and* queue. Reading either off
+        # the instance later would let a pump that outlives its own stop()
+        # write into a successor's queue.
         proc = self._proc
-        if proc is None or proc.stdout is None:
+        events = self._events
+        if proc is None or proc.stdout is None or events is None:
             return
 
         buffer = bytearray()
@@ -301,19 +338,18 @@ class PrimeClient:
                         break
                     raw = bytes(buffer[:index])
                     del buffer[: index + 1]
-                    self._offer(raw)
+                    self._offer(events, raw)
 
             if buffer:
-                self._offer(bytes(buffer))
+                self._offer(events, bytes(buffer))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("prime-agent stdout pump failed: %s", exc)
         finally:
-            if self._events is not None:
-                self._events.put_nowait(_EOF)
+            events.put_nowait(_EOF)
 
-    def _offer(self, raw: bytes) -> None:
+    def _offer(self, events: asyncio.Queue[dict[str, Any]], raw: bytes) -> None:
         # Tolerate CRLF input by stripping one trailing CR, as the spec asks.
         if raw.endswith(b"\r"):
             raw = raw[:-1]
@@ -324,8 +360,8 @@ class PrimeClient:
         except (UnicodeDecodeError, json.JSONDecodeError):
             logger.warning("prime-agent emitted a non-JSON line; ignoring")
             return
-        if isinstance(event, dict) and self._events is not None:
-            self._events.put_nowait(event)
+        if isinstance(event, dict):
+            events.put_nowait(event)
 
     async def _read_stderr(self) -> None:
         proc = self._proc
