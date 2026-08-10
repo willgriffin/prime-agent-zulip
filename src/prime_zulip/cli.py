@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import PrimeZulipBridge, ZulipEvent
+from .prime import PrimeClient, PrimeConfig, PrimeError
 
 
 def _env_config() -> dict[str, Any]:
@@ -43,6 +45,13 @@ def _env_config() -> dict[str, Any]:
     emails_raw = os.environ.get("ZULIP_ALLOWED_EMAILS", "")
     emails = {x.strip().lower() for x in emails_raw.split(",") if x.strip()}
 
+    require_both = os.environ.get("ZULIP_ALLOW_REQUIRE_BOTH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
     home_channel = os.environ.get("ZULIP_HOME_CHANNEL", "")
     home_dm_user = None
     if home_channel.startswith("dm:"):
@@ -56,33 +65,74 @@ def _env_config() -> dict[str, Any]:
         "api_key": api_key,
         "user_ids": user_ids,
         "emails": emails,
+        "require_both": require_both,
         "home_dm_user": home_dm_user,
     }
 
 
-async def _cmd_listen() -> None:
-    """Listen for Zulip events and print them."""
-    config = _env_config()
-    bridge = PrimeZulipBridge(
+def _build_bridge(config: dict[str, Any]) -> PrimeZulipBridge:
+    """Construct a bridge from a parsed config, applying the allowlist policy."""
+    return PrimeZulipBridge(
         site=config["site"],
         email=config["email"],
         api_key=config["api_key"],
         allowed_user_ids=config["user_ids"],
         allowed_emails=config["emails"],
+        require_both=config.get("require_both", False),
     )
+
+
+async def _cmd_listen() -> None:
+    """Relay authorized Zulip messages to prime-agent and reply with its answer."""
+    config = _env_config()
+    bridge = _build_bridge(config)
+    prime = PrimeClient(PrimeConfig.from_env())
 
     print(f"Connecting to {config['site']} as {config['email']}...")
     async with bridge:
-        print("Connected! Listening for messages...")
-        async for event in bridge.events():
-            if event.message:
-                msg = event.message
-                print(f"\n[{msg.sender_full_name}] {msg.content[:200]}")
-                # Echo back for now
-                await bridge.reply(msg, f"Received: {msg.content[:500]}")
-            elif event.reaction:
-                r = event.reaction
-                print(f"\nReaction: {r.user_email} {r.op} {r.emoji_name} on msg {r.message_id}")
+        await prime.start()
+        print("Connected! Relaying messages to prime-agent...")
+        try:
+            async for event in bridge.events():
+                if event.message:
+                    await _relay(bridge, prime, event.message)
+                elif event.reaction:
+                    r = event.reaction
+                    print(
+                        f"\nReaction: {r.user_email} {r.op} {r.emoji_name} on msg {r.message_id}"
+                    )
+        finally:
+            await prime.stop()
+
+
+async def _relay(bridge: PrimeZulipBridge, prime: PrimeClient, msg: Any) -> None:
+    """Hand one operator message to Prime and post the answer back.
+
+    A failure here is reported into the conversation rather than raised. The
+    operator is on the other end of this socket, and a bridge that dies
+    silently on one bad turn looks identical to a bridge that was never
+    listening.
+    """
+    print(f"\n[{msg.sender_full_name}] {msg.content[:200]}")
+
+    await bridge.typing_start(msg.chat_id, msg.metadata)
+    try:
+        answer = await prime.ask(msg.content)
+    except PrimeError as exc:
+        logging.getLogger(__name__).error("prime-agent failed: %s", exc)
+        answer = f":warning: prime-agent could not answer: {exc}"
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.getLogger(__name__).exception("unexpected relay failure")
+        answer = f":warning: bridge error: {exc}"
+    finally:
+        await bridge.typing_stop(msg.chat_id, msg.metadata)
+
+    if not answer.strip():
+        # Prime legitimately finishes some turns with no prose -- a pure tool
+        # run, for instance. Saying so beats posting an empty message.
+        answer = "_(prime-agent finished without a text response)_"
+
+    await bridge.reply(msg, answer)
 
 
 async def _cmd_send(message: str) -> None:
@@ -92,13 +142,7 @@ async def _cmd_send(message: str) -> None:
         print("No ZULIP_HOME_CHANNEL dm: user configured", file=sys.stderr)
         sys.exit(1)
 
-    bridge = PrimeZulipBridge(
-        site=config["site"],
-        email=config["email"],
-        api_key=config["api_key"],
-        allowed_user_ids=config["user_ids"],
-        allowed_emails=config["emails"],
-    )
+    bridge = _build_bridge(config)
 
     async with bridge:
         ids = await bridge.send_dm(config["home_dm_user"], message)
@@ -109,13 +153,7 @@ async def _cmd_dm(user_id: str, message: str) -> None:
     """Send a DM to a specific user."""
     config = _env_config()
 
-    bridge = PrimeZulipBridge(
-        site=config["site"],
-        email=config["email"],
-        api_key=config["api_key"],
-        allowed_user_ids=config["user_ids"],
-        allowed_emails=config["emails"],
-    )
+    bridge = _build_bridge(config)
 
     async with bridge:
         uid = int(user_id)
@@ -130,17 +168,21 @@ async def _cmd_status() -> None:
         print("Not configured — set ZULIP_SITE, ZULIP_EMAIL, ZULIP_API_KEY")
         sys.exit(1)
 
-    bridge = PrimeZulipBridge(
-        site=config["site"],
-        email=config["email"],
-        api_key=config["api_key"],
-    )
+    # Built through the same path as `listen`, so what status reports is the
+    # policy that would actually be enforced rather than an empty default.
+    bridge = _build_bridge(config)
 
     async with bridge:
+        allowlist = bridge.config.allowlist
         print(f"Site: {config['site']}")
         print(f"Bot: {bridge._bot_email} (ID: {bridge._bot_user_id})")
         print(f"Queue: {bridge._queue_id}")
-        print(f"Allowlist: {bridge.config.allowlist}")
+        print(f"Allowlist: {allowlist}")
+        print(f"Allowlist usable: {allowlist.is_configured}")
+        if not allowlist.is_configured:
+            print("  -> every inbound message will be rejected")
+        prime_argv = PrimeConfig.from_env().argv()
+        print(f"Prime command: {' '.join(prime_argv)}")
         print("Connection: OK")
 
 
@@ -156,13 +198,7 @@ async def _cmd_heartbeat() -> None:
     state_file = state_dir / "state.json"
 
     config = _env_config()
-    bridge = PrimeZulipBridge(
-        site=config["site"],
-        email=config["email"],
-        api_key=config["api_key"],
-        allowed_user_ids=config["user_ids"],
-        allowed_emails=config["emails"],
-    )
+    bridge = _build_bridge(config)
 
     async with bridge:
         # Process one event with a timeout

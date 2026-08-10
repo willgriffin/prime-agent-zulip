@@ -70,6 +70,7 @@ class PrimeZulipBridge:
         api_key: str,
         allowed_user_ids: set[int] | None = None,
         allowed_emails: set[str] | None = None,
+        require_both: bool = False,
         bot_names: set[str] | None = None,
         max_message_chars: int = DEFAULT_MAX_CHARS,
         attachment_max_bytes: int = 25_000_000,
@@ -78,6 +79,7 @@ class PrimeZulipBridge:
         allowlist = Allowlist(
             user_ids=allowed_user_ids or set(),
             emails=allowed_emails or set(),
+            require_both=require_both,
         )
         if bot_names is None:
             local_part = email.split("@", 1)[0] if email else ""
@@ -115,7 +117,15 @@ class PrimeZulipBridge:
     async def connect(self) -> None:
         """Initialize the HTTP client, register an event queue, and start polling."""
         if not self.config.allowlist.is_configured:
-            logger.warning("Zulip bridge: no allowlist configured — all messages will be rejected")
+            if self.config.allowlist.require_both:
+                logger.warning(
+                    "Zulip bridge: requireBoth is set but only one of the user-ID / email "
+                    "allowlists is populated — all messages will be rejected"
+                )
+            else:
+                logger.warning(
+                    "Zulip bridge: no allowlist configured — all messages will be rejected"
+                )
 
         self._client = ZulipClient(
             site_url=self.config.site_url,

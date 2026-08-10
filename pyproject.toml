@@ -1,12 +1,18 @@
 [project]
 name = "prime-agent-zulip"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zulip bridge for Prime Agent: persistent chat with full message interactivity"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "zulip>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
 ]
 
 [project.scripts]
@@ -18,3 +24,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prime_zulip"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
