@@ -22,5 +22,14 @@ Usage:
 
 from .bridge import PrimeZulipBridge, ZulipEvent, ZulipMessage
 from .auth import Allowlist
+from .prime import PrimeClient, PrimeConfig, PrimeError
 
-__all__ = ["PrimeZulipBridge", "ZulipEvent", "ZulipMessage", "Allowlist"]
+__all__ = [
+    "PrimeZulipBridge",
+    "ZulipEvent",
+    "ZulipMessage",
+    "Allowlist",
+    "PrimeClient",
+    "PrimeConfig",
+    "PrimeError",
+]
