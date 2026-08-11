@@ -37,8 +37,8 @@ uv pip install git+https://github.com/willgriffin/prime-agent-zulip.git
 Set environment variables:
 
 ```bash
-export ZULIP_SITE="https://chat.happyvertical.com"
-export ZULIP_EMAIL="cricket@happyvertical.com"
+export ZULIP_SITE="https://zulip.example.com"
+export ZULIP_EMAIL="agent@example.com"
 export ZULIP_API_KEY="your-api-key"
 export ZULIP_ALLOWED_USER_IDS="8"
 export ZULIP_HOME_CHANNEL="dm:8"
@@ -82,8 +82,8 @@ prime-zulip heartbeat
 from prime_zulip import PrimeZulipBridge
 
 bridge = PrimeZulipBridge(
-    site="https://chat.happyvertical.com",
-    email="cricket@happyvertical.com",
+    site="https://zulip.example.com",
+    email="agent@example.com",
     api_key="...",
     allowed_user_ids={8},
 )

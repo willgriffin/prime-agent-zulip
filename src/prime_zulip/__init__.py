@@ -9,8 +9,8 @@ Usage:
     from prime_zulip import PrimeZulipBridge
 
     bridge = PrimeZulipBridge(
-        site="https://chat.happyvertical.com",
-        email="cricket@happyvertical.com",
+        site="https://zulip.example.com",
+        email="agent@example.com",
         api_key="...",
         allowed_user_ids={8},
     )
