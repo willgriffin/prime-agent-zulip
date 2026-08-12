@@ -22,6 +22,7 @@ Usage:
 
 from .bridge import PrimeZulipBridge, ZulipEvent, ZulipMessage
 from .auth import Allowlist
+from .client import BadEventQueueError, ZulipAPIError
 from .prime import PrimeClient, PrimeConfig, PrimeError
 
 __all__ = [
@@ -29,6 +30,8 @@ __all__ = [
     "ZulipEvent",
     "ZulipMessage",
     "Allowlist",
+    "BadEventQueueError",
+    "ZulipAPIError",
     "PrimeClient",
     "PrimeConfig",
     "PrimeError",

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .auth import Allowlist
-from .client import ZulipAPIError, ZulipClient
+from .client import BadEventQueueError, ZulipAPIError, ZulipClient
 from .events import ZulipEvent, categorize_event
 from .messages import DEFAULT_MAX_CHARS, ZulipMessage, split_message
 
@@ -398,7 +398,12 @@ class PrimeZulipBridge:
         if self._client is None or self._queue_id is None:
             return
 
-        payload = await self._client.get_events(self._queue_id, self._last_event_id)
+        try:
+            payload = await self._client.get_events(self._queue_id, self._last_event_id)
+        except BadEventQueueError:
+            logger.warning("Zulip event queue expired — re-registering")
+            await self._reregister_queue()
+            return
 
         if payload.get("result") == "error":
             code = str(payload.get("code", "")).upper()

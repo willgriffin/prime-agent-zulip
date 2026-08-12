@@ -17,6 +17,18 @@ class ZulipAPIError(Exception):
     """Raised when the Zulip API returns an error."""
 
 
+class BadEventQueueError(ZulipAPIError):
+    """Raised when Zulip reports the event queue is gone (BAD_EVENT_QUEUE_ID).
+
+    Queue IDs expire after roughly ten minutes. The poll loop catches this
+    specifically so it can re-register rather than spinning on 400s.
+    """
+
+    def __init__(self, msg: str, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(msg)
+        self.payload = payload or {}
+
+
 class ZulipClient:
     """Async HTTP client for the Zulip REST API using basic auth."""
 
@@ -282,5 +294,23 @@ class ZulipClient:
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError:
+            # Parse the JSON body so callers can branch on Zulip's machine-
+            # readable ``code`` field rather than scraping the message text.
+            # The most important case is BAD_EVENT_QUEUE_ID: Zulip returns it
+            # as HTTP 400 when the event queue has expired, and without
+            # surfacing it here the poll loop never gets to re-register.
+            payload: dict[str, Any] = {}
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+
+            code = str(payload.get("code", "")).upper()
+            if code == "BAD_EVENT_QUEUE_ID":
+                raise BadEventQueueError(
+                    payload.get("msg") or "BAD_EVENT_QUEUE_ID",
+                    payload,
+                ) from None
+
             body = resp.text[:500] if resp.text else ""
             raise ZulipAPIError(f"HTTP {resp.status_code}: {body}") from None

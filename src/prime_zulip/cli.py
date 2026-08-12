@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -105,6 +106,30 @@ async def _cmd_listen() -> None:
             await prime.stop()
 
 
+TYPING_REFRESH_INTERVAL = 7.0
+
+
+async def _typing_pinger(
+    bridge: PrimeZulipBridge,
+    chat_id: str,
+    metadata: dict[str, Any] | None,
+) -> None:
+    """Re-send ``typing_start`` so Zulip's ~10 s indicator does not expire.
+
+    Zulip auto-expires typing status after roughly ten seconds. Agent turns
+    routinely take much longer, so without periodic refreshes the indicator
+    vanishes while the agent is still working. This loop re-asserts
+    ``typing_start`` every :data:`TYPING_REFRESH_INTERVAL` seconds until
+    cancelled; the ``finally`` in :func:`_relay` sends ``typing_stop``.
+    """
+    while True:
+        await asyncio.sleep(TYPING_REFRESH_INTERVAL)
+        try:
+            await bridge.typing_start(chat_id, metadata)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.getLogger(__name__).debug("typing refresh failed: %s", exc)
+
+
 async def _relay(bridge: PrimeZulipBridge, prime: PrimeClient, msg: Any) -> None:
     """Hand one operator message to Prime and post the answer back.
 
@@ -116,6 +141,9 @@ async def _relay(bridge: PrimeZulipBridge, prime: PrimeClient, msg: Any) -> None
     print(f"\n[{msg.sender_full_name}] {msg.content[:200]}")
 
     await bridge.typing_start(msg.chat_id, msg.metadata)
+    pinger = asyncio.create_task(
+        _typing_pinger(bridge, msg.chat_id, msg.metadata)
+    )
     try:
         answer = await prime.ask(msg.content)
     except PrimeError as exc:
@@ -125,6 +153,9 @@ async def _relay(bridge: PrimeZulipBridge, prime: PrimeClient, msg: Any) -> None
         logging.getLogger(__name__).exception("unexpected relay failure")
         answer = f":warning: bridge error: {exc}"
     finally:
+        pinger.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pinger
         await bridge.typing_stop(msg.chat_id, msg.metadata)
 
     if not answer.strip():
