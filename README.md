@@ -182,6 +182,7 @@ no bypass.
 | `PRIME_AGENT_START_TIMEOUT` | No | Seconds to allow for startup (default 30) |
 | `PRIME_AGENT_SEND_TIMEOUT` | No | Seconds to allow for writing a prompt (default 30) |
 | `PRIME_AGENT_RESPONSE_TIMEOUT` | No | Seconds to allow per answer (default 600) |
+| `PRIME_AGENT_STREAMING_BEHAVIOR` | No | `streamingBehavior` sent on prompts: `followUp` (default; queue a prompt racing an in-flight stream as a follow-up), `steer`, or empty to disable |
 | `PRIME_ZULIP_DEBOUNCE_SECONDS` | No | Quiet time before dispatch; non-negative seconds, default `5`, `0` disables batching |
 | `PRIME_ZULIP_DEBOUNCE_MAX_WAIT_SECONDS` | No | Hard cap from the first message; non-negative seconds, default `20`; values below quiet time are raised to it |
 
