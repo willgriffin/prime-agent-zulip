@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import shutil
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -139,7 +140,7 @@ class PrimeClient:
         self.config = config or PrimeConfig()
         self._proc: asyncio.subprocess.Process | None = None
         self._events: asyncio.Queue[dict[str, Any]] | None = None
-        self._held: list[dict[str, Any]] = []
+        self._held: deque[dict[str, Any]] = deque()
         self._pump: asyncio.Task[None] | None = None
         self._stderr_pump: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -187,7 +188,7 @@ class PrimeClient:
             raise PrimeError(f"could not start prime-agent: {exc}") from exc
 
         self._events = asyncio.Queue()
-        self._held = []
+        self._held = deque()
         self._pump = asyncio.create_task(self._read_stdout(), name="prime-stdout")
         self._stderr_pump = asyncio.create_task(self._read_stderr(), name="prime-stderr")
 
@@ -326,8 +327,9 @@ class PrimeClient:
         assert self._events is not None
         if self._held:
             # Parked while a get_state answer was in flight; replay in
-            # receive order before anything newer from the stream.
-            return self._held.pop(0)
+            # receive order before anything newer from the stream. popleft()
+            # keeps draining O(1) per event instead of list.pop(0)'s O(n).
+            return self._held.popleft()
         return await self._queued_event(deadline)
 
     async def _queued_event(self, deadline: float) -> dict[str, Any]:
@@ -477,12 +479,13 @@ class PrimeClient:
 _EOF: dict[str, Any] = {"type": "__eof__"}
 
 
-def _has_continuation(state: dict[str, Any]) -> bool | None:
+def _has_continuation(state: dict[str, Any] | None) -> bool | None:
     """Classify whether an empty ``agent_end`` has runnable continuation work.
 
     ``True`` means wait for the next cycle, ``False`` means the boundary is
     demonstrably quiet, and ``None`` means the state did not carry enough
-    information to make that call. Queued *steering* is deliberately not a
+    information to make that call (including when ``_query_state`` could not
+    read any state at all). Queued *steering* is deliberately not a
     continuation here: while this client holds its own lock no accepted prompt
     of ours is streaming to be steered, so unrelated steering cannot become
     this answer.

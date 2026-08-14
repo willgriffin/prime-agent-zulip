@@ -28,6 +28,16 @@ QUIET_STATE = {
     "sessionActions": {"queuedCount": 0, "steering": [], "followUps": []},
 }
 
+# Sentinel the STATE_ERROR scenario uses to force the get_state failure path.
+# Typing this as a dict-valued union keeps the module's annotations honest:
+# STATE is always a state payload, None, or this failure sentinel.
+STATE_ERROR: dict = {"__stub__": "state-error"}
+
+
+def is_state_error(value: dict | None) -> bool:
+    return value is STATE_ERROR
+
+
 # Set by continue scenarios once their intermediate boundary has been emitted;
 # the bridge's get_state query at that boundary must see runnable work.
 STATE: dict | None = None
@@ -52,7 +62,7 @@ def handle(command: dict) -> None:
         # Continue scenarios update this after their first boundary. All other
         # prompts are answered before a state query exists, so the default is
         # the quiet state that makes a true empty completion stay empty.
-        if STATE == "ERROR":
+        if is_state_error(STATE):
             emit(
                 {
                     "id": command.get("id"),
@@ -201,7 +211,7 @@ def handle(command: dict) -> None:
         # Empty boundary, but state cannot be read: fail explicitly rather
         # than publishing an empty answer that might be premature.
         emit({"type": "agent_end", "messages": []})
-        STATE = "ERROR"
+        STATE = STATE_ERROR
         return
 
     if message == "MULTIPART":
