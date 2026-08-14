@@ -139,6 +139,7 @@ class PrimeClient:
         self.config = config or PrimeConfig()
         self._proc: asyncio.subprocess.Process | None = None
         self._events: asyncio.Queue[dict[str, Any]] | None = None
+        self._held: list[dict[str, Any]] = []
         self._pump: asyncio.Task[None] | None = None
         self._stderr_pump: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -186,6 +187,7 @@ class PrimeClient:
             raise PrimeError(f"could not start prime-agent: {exc}") from exc
 
         self._events = asyncio.Queue()
+        self._held = []
         self._pump = asyncio.create_task(self._read_stdout(), name="prime-stdout")
         self._stderr_pump = asyncio.create_task(self._read_stderr(), name="prime-stderr")
 
@@ -322,6 +324,14 @@ class PrimeClient:
 
     async def _next_event(self, deadline: float) -> dict[str, Any]:
         assert self._events is not None
+        if self._held:
+            # Parked while a get_state answer was in flight; replay in
+            # receive order before anything newer from the stream.
+            return self._held.pop(0)
+        return await self._queued_event(deadline)
+
+    async def _queued_event(self, deadline: float) -> dict[str, Any]:
+        assert self._events is not None
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise PrimeError(
@@ -335,14 +345,16 @@ class PrimeClient:
             ) from None
 
     async def _query_state(self, request_id: str, deadline: float) -> dict[str, Any] | None:
-        """Ask the agent for its state without letting the answer starve.
+        """Ask the agent for its state without losing events.
 
         Ordinary 0.7.1 RPC events carry no prompt-correlation ID, so an empty
         ``agent_end`` is ambiguous: it can be the final quiet turn, or a
         session-action boundary with another cycle queued immediately behind
         it. ``get_state`` is the only exposed discriminator. Events received
-        while that response is in flight are requeued before the state reply
-        so they remain candidates for this same answer.
+        while that response is in flight are parked on ``self._held`` and
+        replayed first by ``_next_event``. The stdout pump keeps writing to
+        the one queue it bound at start, so events that arrive after the
+        state answer stay visible to this same run.
         """
         try:
             await asyncio.wait_for(
@@ -352,30 +364,18 @@ class PrimeClient:
         except (PrimeError, asyncio.TimeoutError):
             return None
 
-        held: list[dict[str, Any]] = []
-        try:
-            while True:
-                event = await self._next_event(deadline)
-                if event is _EOF:
-                    raise PrimeError("prime-agent exited before answering")
-                if event.get("type") == "response" and event.get("id") == request_id:
-                    if not event.get("success", False):
-                        return None
-                    data = event.get("data")
-                    return data if isinstance(data, dict) else None
-                held.append(event)
-        finally:
-            if held:
-                assert self._events is not None
-                queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-                for event in held:
-                    queue.put_nowait(event)
-                while True:
-                    try:
-                        queue.put_nowait(self._events.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-                self._events = queue
+        while True:
+            # Read the live queue only: replaying ``self._held`` here would
+            # re-park the same events forever.
+            event = await self._queued_event(deadline)
+            if event is _EOF:
+                raise PrimeError("prime-agent exited before answering")
+            if event.get("type") == "response" and event.get("id") == request_id:
+                if not event.get("success", False):
+                    return None
+                data = event.get("data")
+                return data if isinstance(data, dict) else None
+            self._held.append(event)
 
     async def _send(self, command: dict[str, Any]) -> None:
         proc = self._proc
@@ -389,6 +389,7 @@ class PrimeClient:
             raise PrimeError(f"prime-agent closed its input: {exc}") from exc
 
     def _drain(self) -> None:
+        self._held.clear()
         if self._events is None:
             return
         while True:
@@ -501,22 +502,18 @@ def _has_continuation(state: dict[str, Any]) -> bool | None:
         active = actions.get("active")
         if isinstance(active, dict) and active:
             return True
-        try:
-            followups = len(actions.get("followUps") or [])
-        except TypeError:
-            return None
-        if followups > 0:
-            return True
+        # followUps can represent unrelated autonomous work while this client has
+        # exclusive prompt lock; they are not reliable evidence that this ask is
+        # not finished.
 
     try:
-        queued = int(state.get("queuedActionCount", 0))
         unfinished = int(state.get("unfinishedActionCount", 0))
     except (TypeError, ValueError):
         return None
-    if queued > 0 or unfinished > 0:
+    if unfinished > 0:
         return True
 
-    # isStreaming=false with the queue fields above at zero is a quiescent
+    # isStreaming=false with no unfinished actions is a quiescent
     # boundary even when the server omits optional booleans such as
     # isCompacting.
     if state.get("isStreaming") is False:

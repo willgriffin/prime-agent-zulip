@@ -31,6 +31,11 @@ QUIET_STATE = {
 # Set by continue scenarios once their intermediate boundary has been emitted;
 # the bridge's get_state query at that boundary must see runnable work.
 STATE: dict | None = None
+# Set when a scenario has emitted its empty boundary and still owes a
+# continuation. The continuation is emitted *after* answering the bridge's
+# get_state, reproducing the production interleaving where agent_start
+# follows the empty agent_end while the state query is in flight.
+PENDING: str | None = None
 
 
 def assistant(text: str) -> dict:
@@ -42,6 +47,7 @@ def assistant(text: str) -> dict:
 
 
 def handle(command: dict) -> None:
+    global STATE, PENDING
     if command.get("type") == "get_state":
         # Continue scenarios update this after their first boundary. All other
         # prompts are answered before a state query exists, so the default is
@@ -66,6 +72,22 @@ def handle(command: dict) -> None:
                     "data": STATE if STATE is not None else QUIET_STATE,
                 }
             )
+        pending, PENDING = PENDING, None
+        if pending == "CONTINUE_TEXT":
+            # The continued root cycle begins only once the state answer has
+            # been written, exactly as the daemon emitted agent_start ~22ms
+            # after the boundary in the incident.
+            STATE = QUIET_STATE
+            emit({"type": "agent_start"})
+            final = assistant("continued answer")
+            emit({"type": "message_end", "message": final})
+            emit({"type": "agent_end", "messages": [final]})
+        elif pending == "CONTINUE_UNRELATED":
+            STATE = QUIET_STATE
+            emit({"type": "agent_start"})
+            unrelated = assistant("unrelated answer")
+            emit({"type": "message_end", "message": unrelated})
+            emit({"type": "agent_end", "messages": [unrelated]})
         return
 
     if command.get("type") != "prompt":
@@ -127,9 +149,8 @@ def handle(command: dict) -> None:
         return
 
     if message == "CONTINUE_TEXT":
-        # Production regression shape: a tool-only root boundary whose state
-        # still has queued follow-up work, then a second root cycle with prose.
-        global STATE
+        # Production regression shape: a tool-only root boundary with no text,
+        # while actionable work is still queued and the next root cycle continues.
         emit(
             {
                 "type": "message_end",
@@ -146,6 +167,7 @@ def handle(command: dict) -> None:
         emit({"type": "agent_end", "messages": []})
         STATE = {
             **QUIET_STATE,
+            "isStreaming": True,
             "unfinishedActionCount": 1,
             "sessionActions": {
                 "queuedCount": 1,
@@ -154,10 +176,7 @@ def handle(command: dict) -> None:
             },
         }
         emit({"type": "agent_start"})
-        final = assistant("continued answer")
-        STATE = QUIET_STATE
-        emit({"type": "message_end", "message": final})
-        emit({"type": "agent_end", "messages": [final]})
+        PENDING = "CONTINUE_TEXT"
         return
 
     if message == "CONTINUE_UNRELATED":
@@ -165,11 +184,9 @@ def handle(command: dict) -> None:
         # work. State correlation cannot prove ownership in RPC 0.7.1; after a
         # demonstrably quiescent boundary the answer is still the local empty
         # one rather than the unrelated prose.
-        global STATE
         emit({"type": "agent_end", "messages": []})
         STATE = {
             **QUIET_STATE,
-            "unfinishedActionCount": 1,
             "sessionActions": {
                 "queuedCount": 1,
                 "steering": [],
@@ -177,10 +194,7 @@ def handle(command: dict) -> None:
             },
         }
         emit({"type": "agent_start"})
-        unrelated = assistant("unrelated answer")
-        STATE = QUIET_STATE
-        emit({"type": "message_end", "message": unrelated})
-        emit({"type": "agent_end", "messages": [unrelated]})
+        PENDING = "CONTINUE_UNRELATED"
         return
 
     if message == "STATE_ERROR":
