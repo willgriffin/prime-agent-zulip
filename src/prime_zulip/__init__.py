@@ -24,6 +24,7 @@ from .bridge import PrimeZulipBridge, ZulipEvent, ZulipMessage
 from .auth import Allowlist
 from .client import BadEventQueueError, ZulipAPIError
 from .prime import PrimeClient, PrimeConfig, PrimeError
+from .relay import BurstRelay, RelayConfig
 
 __all__ = [
     "PrimeZulipBridge",
@@ -35,4 +36,6 @@ __all__ = [
     "PrimeClient",
     "PrimeConfig",
     "PrimeError",
+    "BurstRelay",
+    "RelayConfig",
 ]

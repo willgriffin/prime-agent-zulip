@@ -294,11 +294,11 @@ class PrimeZulipBridge:
                 if stream_id and topic:
                     await self._client.send_typing(op=op, type="stream", to=[int(stream_id)], topic=topic)
             elif chat_id.startswith("dm:"):
-                user_id = int(chat_id.removeprefix("dm:")) if chat_id[3:].isdigit() else None
-                if user_id:
-                    await self._client.send_typing(op=op, type="direct", to=[user_id])
-                elif meta.get("zulip_sender_id"):
-                    await self._client.send_typing(op=op, type="direct", to=[int(meta["zulip_sender_id"])])
+                participant_ids = _direct_recipient_ids(chat_id, meta)
+                if participant_ids:
+                    await self._client.send_typing(
+                        op=op, type="direct", to=participant_ids
+                    )
         except Exception as exc:
             logger.debug("Zulip typing %s failed: %s", op, exc)
 
@@ -441,6 +441,10 @@ class PrimeZulipBridge:
 
     async def _reregister_queue(self) -> None:
         try:
+            # Typing is transient and cannot be reconstructed across queues.
+            # Notify consumers before any event from the replacement queue.
+            if self._event_queue is not None:
+                await self._event_queue.put(ZulipEvent(type="queue_reset"))
             queue_data = await self._client.register_queue()
             self._queue_id = queue_data["queue_id"]
             self._last_event_id = max(
@@ -473,22 +477,46 @@ def _build_send_payload(
         payload["to"] = stream_to
         payload["topic"] = topic
     elif chat_id.startswith("dm:"):
-        user_id = chat_id.removeprefix("dm:")
-        if user_id.isdigit():
-            payload["type"] = "direct"
-            payload["to"] = f"[{user_id}]"
-        elif metadata.get("zulip_sender_id"):
-            payload["type"] = "direct"
-            payload["to"] = f"[{metadata['zulip_sender_id']}]"
+        recipient_ids = _direct_recipient_ids(chat_id, metadata)
+        payload["type"] = "direct"
+        if recipient_ids:
+            payload["to"] = json.dumps(recipient_ids)
         else:
-            # Try email-based
+            # Fall back to email only for legacy/non-canonical callers.
             sender_email = metadata.get("zulip_sender_email", "")
-            payload["type"] = "direct"
             payload["to"] = json.dumps([sender_email])
     else:
         raise ValueError(f"Unsupported chat_id: {chat_id}")
 
     return payload
+
+
+def _direct_recipient_ids(
+    chat_id: str,
+    metadata: dict[str, Any],
+) -> list[int]:
+    """Return all non-bot DM participants for replies and typing operations."""
+    raw_ids = metadata.get("zulip_recipient_user_ids")
+    if isinstance(raw_ids, list):
+        candidates = raw_ids
+    else:
+        candidates = chat_id.removeprefix("dm:").split(",")
+    bot_id = metadata.get("zulip_bot_user_id")
+    result: set[int] = set()
+    for value in candidates:
+        try:
+            user_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if bot_id is not None and str(user_id) == str(bot_id):
+            continue
+        result.add(user_id)
+    if not result and metadata.get("zulip_sender_id") is not None:
+        try:
+            result.add(int(metadata["zulip_sender_id"]))
+        except (TypeError, ValueError):
+            pass
+    return sorted(result)
 
 
 import contextlib, json  # noqa: E402

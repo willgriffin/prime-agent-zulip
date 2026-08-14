@@ -32,12 +32,27 @@ class ReactionEvent:
 
 
 @dataclass
-class ZulipEvent:
-    """A received Zulip event — either a message or a reaction on a tracked message."""
+class TypingEvent:
+    """An authorized typing notification for one canonical conversation."""
 
-    type: str  # "message" or "reaction"
+    op: str
+    sender_id: int
+    sender_email: str
+    chat_id: str
+    is_dm: bool
+    stream_id: int | None = None
+    topic: str | None = None
+
+
+@dataclass
+class ZulipEvent:
+    """A normalized inbound event recorded from Zulip's event queue."""
+
+    type: str  # "message", "reaction", "typing", or "queue_reset"
     message: ZulipMessage | None = None
     reaction: ReactionEvent | None = None
+    typing: TypingEvent | None = None
+    event_id: int | None = None
 
 
 def categorize_event(
@@ -50,17 +65,25 @@ def categorize_event(
     """Convert a raw Zulip event dict into a ZulipEvent or None if ignored."""
     event_type = event.get("type")
 
+    event_id = _event_id(event)
+
     if event_type == "message":
         msg = _parse_message_event(event, bot_user_id, bot_email, bot_names, allowlist)
         if msg is None:
             return None
-        return ZulipEvent(type="message", message=msg)
+        return ZulipEvent(type="message", message=msg, event_id=event_id)
 
     if event_type == "reaction":
         reaction = _parse_reaction_event(event, bot_user_id, allowlist)
         if reaction is None:
             return None
-        return ZulipEvent(type="reaction", reaction=reaction)
+        return ZulipEvent(type="reaction", reaction=reaction, event_id=event_id)
+
+    if event_type == "typing":
+        typing = _parse_typing_event(event, bot_user_id, bot_email, allowlist)
+        if typing is None:
+            return None
+        return ZulipEvent(type="typing", typing=typing, event_id=event_id)
 
     return None
 
@@ -108,8 +131,9 @@ def _parse_message_event(
         content = strip_leading_mention(content, bot_names)
 
     # Build chat_id for routing
+    participant_ids: tuple[int, ...] = ()
     if is_dm:
-        chat_id, chat_name = _dm_routing(message, bot_user_id)
+        chat_id, chat_name, participant_ids = _dm_routing(message, bot_user_id)
     else:
         chat_id, chat_name = _stream_routing(message)
 
@@ -136,8 +160,96 @@ def _parse_message_event(
             "zulip_stream_id": message.get("stream_id"),
             "zulip_topic": message.get("topic") or message.get("subject"),
             "zulip_recipient_id": message.get("recipient_id"),
+            "zulip_recipient_user_ids": list(participant_ids),
+            "zulip_bot_user_id": _int_or_none(bot_user_id),
         },
     )
+
+
+def _parse_typing_event(
+    event: dict[str, Any],
+    bot_user_id: str | None,
+    bot_email: str,
+    allowlist: Allowlist,
+) -> TypingEvent | None:
+    """Parse typing without letting it bypass or modify message authorization."""
+    op = str(event.get("op", "")).lower()
+    if op not in {"start", "stop"}:
+        return None
+
+    sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+    sender_id = _int_or_none(sender.get("user_id") or sender.get("id") or event.get("sender_id"))
+    sender_email = str(sender.get("email") or event.get("sender_email") or "").lower()
+    if sender_id is None:
+        return None
+    if str(sender_id) == str(bot_user_id) or (
+        sender_email and sender_email == bot_email.lower()
+    ):
+        return None
+    if not allowlist.allows(user_id=sender_id, email=sender_email):
+        return None
+
+    message_type = str(event.get("message_type") or event.get("type_name") or "").lower()
+    if message_type in DIRECT_MESSAGE_TYPES:
+        recipients = event.get("recipients")
+        participants = recipients if isinstance(recipients, list) else []
+        participant_ids = _participant_ids(participants)
+        participant_ids.add(sender_id)
+        bot_id = _int_or_none(bot_user_id)
+        if bot_id is not None:
+            participant_ids.add(bot_id)
+        if not participant_ids:
+            return None
+        chat_id = "dm:" + ",".join(str(uid) for uid in sorted(participant_ids))
+        return TypingEvent(
+            op=op,
+            sender_id=sender_id,
+            sender_email=sender_email,
+            chat_id=chat_id,
+            is_dm=True,
+        )
+
+    if message_type in {"stream", "channel"}:
+        stream_id = _int_or_none(event.get("stream_id"))
+        topic = str(event.get("topic") or "")
+        if stream_id is None or not topic:
+            return None
+        return TypingEvent(
+            op=op,
+            sender_id=sender_id,
+            sender_email=sender_email,
+            chat_id=f"stream:{stream_id}:topic:{topic}",
+            is_dm=False,
+            stream_id=stream_id,
+            topic=topic,
+        )
+
+    return None
+
+
+def _event_id(event: dict[str, Any]) -> int | None:
+    return _int_or_none(event.get("id"))
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _recipient_user_id(recipient: dict[str, Any]) -> int | None:
+    return _int_or_none(recipient.get("user_id") or recipient.get("id"))
+
+
+def _participant_ids(recipients: list[Any]) -> set[int]:
+    return {
+        uid
+        for recipient in recipients
+        if isinstance(recipient, dict)
+        for uid in [_recipient_user_id(recipient)]
+        if uid is not None
+    }
 
 
 def _parse_reaction_event(
@@ -178,26 +290,29 @@ def _parse_reaction_event(
 def _dm_routing(
     message: dict[str, Any],
     bot_user_id: str | None,
-) -> tuple[str, str]:
-    """Build routing key and display name for a DM."""
-    sender_id = message.get("sender_id")
-    chat_id = f"dm:{sender_id}" if sender_id is not None else "dm:unknown"
-
+) -> tuple[str, str, tuple[int, ...]]:
+    """Build a canonical participant-set key and display name for a DM."""
     display_recipient = message.get("display_recipient")
-    if isinstance(display_recipient, list):
-        names = [d.get("full_name", d.get("email", "")) for d in display_recipient if isinstance(d, dict)]
-        # Exclude bot from display name
-        if bot_user_id:
-            names = [
-                d.get("full_name", d.get("email", ""))
-                for d in display_recipient
-                if isinstance(d, dict) and str(d.get("id")) != bot_user_id
-            ]
-        chat_name = ", ".join(n for n in names if n) or "Zulip DM"
-    else:
-        chat_name = str(message.get("sender_full_name") or message.get("sender_email") or "Zulip DM")
+    participants = display_recipient if isinstance(display_recipient, list) else []
+    participant_ids = _participant_ids(participants)
+    sender_id = _int_or_none(message.get("sender_id"))
+    bot_id = _int_or_none(bot_user_id)
+    participant_ids.update(uid for uid in (sender_id, bot_id) if uid is not None)
+    ordered_ids = tuple(sorted(participant_ids))
+    chat_id = "dm:" + ",".join(str(uid) for uid in ordered_ids) if ordered_ids else "dm:unknown"
 
-    return chat_id, chat_name
+    names = [
+        str(d.get("full_name") or d.get("email") or "")
+        for d in participants
+        if isinstance(d, dict) and _recipient_user_id(d) != bot_id
+    ]
+    chat_name = ", ".join(n for n in names if n)
+    if not chat_name:
+        chat_name = str(
+            message.get("sender_full_name") or message.get("sender_email") or "Zulip DM"
+        )
+
+    return chat_id, chat_name, ordered_ids
 
 
 def _stream_routing(message: dict[str, Any]) -> tuple[str, str]:

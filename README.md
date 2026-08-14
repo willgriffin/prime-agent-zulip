@@ -7,6 +7,7 @@ Agent to a Zulip organization via the Zulip Events API, handling DMs, stream
 ## Features
 
 - **Persistent polling** — long-polls Zulip's event queue; auto re-registers on expiry
+- **Thought-burst batching** — waits for a quiet pause, honors typing status, and caps the wait
 - **Full Markdown** — code blocks, tables, quotes, spoilers, links, images
 - **DMs & streams** — responds to DMs and stream @mentions; replies stay in-context
 - **Reactions** — add/remove emoji reactions on messages
@@ -63,6 +64,14 @@ prime-zulip listen
 This starts one `prime-agent --mode rpc` subprocess and keeps it for the life
 of the process, so the conversation carries across messages. Point it at a
 specific build with `PRIME_AGENT_BIN` when `prime-agent` is not on `PATH`.
+
+By default, incoming messages in the same DM/group DM or stream topic are
+collected until five seconds of quiet, then sent to Prime as one ordered turn.
+Typing start/repeat extends that quiet period only when a message is already
+pending; typing stop resumes it, and a hard 20-second cap prevents a missing
+stop event from starving the turn. Typing notifications by themselves never
+invoke Prime. Set `PRIME_ZULIP_DEBOUNCE_SECONDS=0` to restore immediate
+one-message behavior.
 
 Send a one-shot DM:
 
@@ -168,6 +177,8 @@ no bypass.
 | `PRIME_AGENT_START_TIMEOUT` | No | Seconds to allow for startup (default 30) |
 | `PRIME_AGENT_SEND_TIMEOUT` | No | Seconds to allow for writing a prompt (default 30) |
 | `PRIME_AGENT_RESPONSE_TIMEOUT` | No | Seconds to allow per answer (default 600) |
+| `PRIME_ZULIP_DEBOUNCE_SECONDS` | No | Quiet time before dispatch; non-negative seconds, default `5`, `0` disables batching |
+| `PRIME_ZULIP_DEBOUNCE_MAX_WAIT_SECONDS` | No | Hard cap from the first message; non-negative seconds, default `20`; values below quiet time are raised to it |
 
 No credential is ever placed in the agent's argv — argv is world-readable via
 `/proc`. What the agent needs reaches it through the inherited environment.
@@ -193,8 +204,10 @@ a running daemon and must not be configured to start a second one.
 
 Prompts are **serialised**: one in flight at a time. The protocol rejects a
 prompt sent mid-stream unless it carries a `streamingBehavior`, and serialising
-is also the only way a reply can be attributed to the prompt that caused it. A
-second operator message waits its turn rather than racing.
+is also the only way a reply can be attributed to the prompt that caused it.
+Messages arriving while Prime is answering are polled immediately and form the
+next conversation batch; one scheduler and one worker bound task growth even
+when many conversations are active.
 
 If the agent dies, the next message restarts it. Failures are reported into the
 Zulip conversation instead of killing the listener, because a bridge that dies
