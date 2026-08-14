@@ -43,6 +43,12 @@ DEFAULT_RESPONSE_TIMEOUT = 600.0
 # under the same lock every later prompt queues on.
 DEFAULT_SEND_TIMEOUT = 30.0
 
+# Default streamingBehavior for prompts: a prompt that lands while the agent
+# is still streaming an earlier answer is queued as a follow-up rather than
+# rejected. "followUp" (not "steer") matches the bridge's one-turn-at-a-time
+# serialisation: the follow-up runs only after the current turn fully stops.
+DEFAULT_STREAMING_BEHAVIOR = "followUp"
+
 # Stripped from the agent's environment before launch.
 #
 # The agent has tool and shell access and its output is relayed verbatim back
@@ -78,6 +84,9 @@ class PrimeConfig:
     start_timeout: float = DEFAULT_START_TIMEOUT
     send_timeout: float = DEFAULT_SEND_TIMEOUT
     response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
+    # Sent on every prompt so a message that races an in-flight stream is
+    # queued as a follow-up instead of rejected (docs/rpc.md). Empty disables.
+    streaming_behavior: str = DEFAULT_STREAMING_BEHAVIOR
     env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -103,6 +112,9 @@ class PrimeConfig:
             send_timeout=_float(src.get("PRIME_AGENT_SEND_TIMEOUT"), DEFAULT_SEND_TIMEOUT),
             response_timeout=_float(
                 src.get("PRIME_AGENT_RESPONSE_TIMEOUT"), DEFAULT_RESPONSE_TIMEOUT
+            ),
+            streaming_behavior=src.get(
+                "PRIME_AGENT_STREAMING_BEHAVIOR", DEFAULT_STREAMING_BEHAVIOR
             ),
         )
 
@@ -233,9 +245,12 @@ class PrimeClient:
 
         self._counter += 1
         request_id = f"zulip-{self._counter}"
+        command: dict[str, Any] = {"id": request_id, "type": "prompt", "message": message}
+        if self.config.streaming_behavior:
+            command["streamingBehavior"] = self.config.streaming_behavior
         try:
             await asyncio.wait_for(
-                self._send({"id": request_id, "type": "prompt", "message": message}),
+                self._send(command),
                 timeout=self.config.send_timeout,
             )
         except asyncio.TimeoutError:

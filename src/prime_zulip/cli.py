@@ -11,16 +11,41 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import PrimeZulipBridge, ZulipEvent
-from .prime import PrimeClient, PrimeConfig, PrimeError
+from .prime import PrimeClient, PrimeConfig
+from .relay import BurstRelay, RelayConfig
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {raw!r}")
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {raw!r}")
+    return value
 
 
 def _env_config() -> dict[str, Any]:
@@ -68,6 +93,9 @@ def _env_config() -> dict[str, Any]:
         "emails": emails,
         "require_both": require_both,
         "home_dm_user": home_dm_user,
+        "debounce_seconds": _env_float("PRIME_ZULIP_DEBOUNCE_SECONDS", 5.0),
+        "max_wait_seconds": _env_float("PRIME_ZULIP_DEBOUNCE_MAX_WAIT_SECONDS", 20.0),
+        "seen_messages_limit": _env_int("PRIME_ZULIP_SEEN_MESSAGES_LIMIT", 4096),
     }
 
 
@@ -89,81 +117,34 @@ async def _cmd_listen() -> None:
     bridge = _build_bridge(config)
     prime = PrimeClient(PrimeConfig.from_env())
 
+    relay = BurstRelay(
+        bridge,
+        prime,
+        RelayConfig(
+            debounce_seconds=config["debounce_seconds"],
+            max_wait_seconds=config["max_wait_seconds"],
+            seen_messages_limit=config["seen_messages_limit"],
+        ),
+    )
     print(f"Connecting to {config['site']} as {config['email']}...")
     async with bridge:
         await prime.start()
+        await relay.start()
         print("Connected! Relaying messages to prime-agent...")
         try:
             async for event in bridge.events():
-                if event.message:
-                    await _relay(bridge, prime, event.message)
+                if event.message or event.typing or event.type == "queue_reset":
+                    # Recording is bounded bookkeeping; timers and Prime execute
+                    # in the relay's scheduler/worker, never in the poll loop.
+                    await relay.record(event)
                 elif event.reaction:
                     r = event.reaction
                     print(
                         f"\nReaction: {r.user_email} {r.op} {r.emoji_name} on msg {r.message_id}"
                     )
         finally:
+            await relay.close()
             await prime.stop()
-
-
-TYPING_REFRESH_INTERVAL = 7.0
-
-
-async def _typing_pinger(
-    bridge: PrimeZulipBridge,
-    chat_id: str,
-    metadata: dict[str, Any] | None,
-) -> None:
-    """Re-send ``typing_start`` so Zulip's ~10 s indicator does not expire.
-
-    Zulip auto-expires typing status after roughly ten seconds. Agent turns
-    routinely take much longer, so without periodic refreshes the indicator
-    vanishes while the agent is still working. This loop re-asserts
-    ``typing_start`` every :data:`TYPING_REFRESH_INTERVAL` seconds until
-    cancelled; the ``finally`` in :func:`_relay` sends ``typing_stop``.
-    """
-    while True:
-        await asyncio.sleep(TYPING_REFRESH_INTERVAL)
-        try:
-            await bridge.typing_start(chat_id, metadata)
-        except Exception as exc:  # pragma: no cover - defensive
-            logging.getLogger(__name__).debug("typing refresh failed: %s", exc)
-
-
-async def _relay(bridge: PrimeZulipBridge, prime: PrimeClient, msg: Any) -> None:
-    """Hand one operator message to Prime and post the answer back.
-
-    A failure here is reported into the conversation rather than raised. The
-    operator is on the other end of this socket, and a bridge that dies
-    silently on one bad turn looks identical to a bridge that was never
-    listening.
-    """
-    print(f"\n[{msg.sender_full_name}] {msg.content[:200]}")
-
-    await bridge.typing_start(msg.chat_id, msg.metadata)
-    pinger = asyncio.create_task(
-        _typing_pinger(bridge, msg.chat_id, msg.metadata)
-    )
-    try:
-        answer = await prime.ask(msg.content)
-    except PrimeError as exc:
-        logging.getLogger(__name__).error("prime-agent failed: %s", exc)
-        answer = f":warning: prime-agent could not answer: {exc}"
-    except Exception as exc:  # pragma: no cover - defensive
-        logging.getLogger(__name__).exception("unexpected relay failure")
-        answer = f":warning: bridge error: {exc}"
-    finally:
-        pinger.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pinger
-        await bridge.typing_stop(msg.chat_id, msg.metadata)
-
-    if not answer.strip():
-        # Prime legitimately finishes some turns with no prose -- a pure tool
-        # run, for instance. Saying so beats posting an empty message.
-        answer = "_(prime-agent finished without a text response)_"
-
-    await bridge.reply(msg, answer)
 
 
 async def _cmd_send(message: str) -> None:

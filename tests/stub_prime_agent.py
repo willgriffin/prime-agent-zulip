@@ -59,6 +59,14 @@ def handle(command: dict) -> None:
 
     emit({"type": "agent_start"})
 
+    if message == "SHOW_BEHAVIOR":
+        # Echo the raw payload field so tests can assert what the client sent.
+        behavior = command.get("streamingBehavior") or "none"
+        msg = assistant(f"behavior: {behavior}")
+        emit({"type": "message_end", "message": msg})
+        emit({"type": "agent_end", "messages": [msg]})
+        return
+
     if message == "TOOL_ONLY":
         # A turn that runs a tool and says nothing. Valid, and must not be
         # reported as an assistant reply.

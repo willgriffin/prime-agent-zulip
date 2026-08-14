@@ -10,7 +10,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-MESSAGE_EVENT_TYPES = ["message", "reaction"]
+MESSAGE_EVENT_TYPES = ["message", "reaction", "typing"]
 
 
 class ZulipAPIError(Exception):
@@ -75,6 +75,9 @@ class ZulipClient:
             data={
                 "event_types": json.dumps(types),
                 "apply_markdown": "false",
+                "client_capabilities": json.dumps(
+                    {"stream_typing_notifications": True}
+                ),
             },
         )
         if payload.get("result") == "error":
