@@ -52,6 +52,19 @@ class TestRoundTrip:
         async with PrimeClient(stub_config()) as prime:
             assert await prime.ask("TOOL_ONLY") == ""
 
+    async def test_prompt_carries_default_streaming_behavior(self):
+        """Follow-up prompts are queued, not rejected, when an answer is streaming."""
+        async with PrimeClient(stub_config()) as prime:
+            assert await prime.ask("SHOW_BEHAVIOR") == "behavior: followUp"
+
+    async def test_streaming_behavior_is_overridable(self):
+        async with PrimeClient(stub_config(streaming_behavior="steer")) as prime:
+            assert await prime.ask("SHOW_BEHAVIOR") == "behavior: steer"
+
+    async def test_streaming_behavior_can_be_omitted(self):
+        async with PrimeClient(stub_config(streaming_behavior="")) as prime:
+            assert await prime.ask("SHOW_BEHAVIOR") == "behavior: none"
+
 
 class TestFraming:
     async def test_unicode_line_separators_survive(self):

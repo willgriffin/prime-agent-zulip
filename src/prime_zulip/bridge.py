@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -518,5 +520,3 @@ def _direct_recipient_ids(
             pass
     return sorted(result)
 
-
-import contextlib, json  # noqa: E402

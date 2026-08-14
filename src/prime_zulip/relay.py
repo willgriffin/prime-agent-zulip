@@ -128,7 +128,15 @@ class BurstRelay:
         async with self._condition:
             if event.type == "queue_reset":
                 for batch in self._pending.values():
-                    batch.typing_users.clear()
+                    if batch.typing_users:
+                        # Clearing a stuck typing block is itself activity:
+                        # restart the quiet window so a batch held for a long
+                        # time is not flushed the instant the blockage clears
+                        # (the reset may have dropped further typing events).
+                        # The max-wait deadline is untouched, so a missing
+                        # stop still cannot starve the batch past its cap.
+                        batch.typing_users.clear()
+                        batch.active_at = self._now()
                 self._condition.notify_all()
                 return
             if event.message is not None:
@@ -204,10 +212,20 @@ class BurstRelay:
                 if not self._pending:
                     await self._condition.wait()
                     continue
-                timeout = max(
-                    0.0,
-                    min(self._deadline(batch) for batch in self._pending.values()) - now,
-                )
+                eligible = [
+                    self._deadline(batch)
+                    for key, batch in self._pending.items()
+                    if key != self._inflight_chat_id
+                ]
+                if not eligible:
+                    # Every pending batch belongs to the in-flight chat and
+                    # cannot fire while it runs. Waiting without a timeout is
+                    # safe: the worker notifies when the in-flight ask ends.
+                    # (Folding the in-flight deadline into the timeout below
+                    # would compute 0 for an elapsed deadline and busy-spin.)
+                    await self._condition.wait()
+                    continue
+                timeout = max(0.0, min(eligible) - now)
                 try:
                     await asyncio.wait_for(self._condition.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
