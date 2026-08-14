@@ -73,6 +73,11 @@ stop event from starving the turn. Typing notifications by themselves never
 invoke Prime. Set `PRIME_ZULIP_DEBOUNCE_SECONDS=0` to restore immediate
 one-message behavior.
 
+Batching is at-most-once and in-memory: a process restart discards pending
+fragments rather than replaying old ones, and a Zulip queue re-registration
+clears stale typing state while replaying caught-up messages through the same
+dedupe and ordering path.
+
 Send a one-shot DM:
 
 ```bash
