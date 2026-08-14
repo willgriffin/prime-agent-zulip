@@ -65,6 +65,21 @@ class TestRoundTrip:
         async with PrimeClient(stub_config(streaming_behavior="")) as prime:
             assert await prime.ask("SHOW_BEHAVIOR") == "behavior: none"
 
+    async def test_empty_boundary_with_continuation_waits_for_later_text(self):
+        """The incident shape: tool-only agent_end, state still busy, then prose."""
+        async with PrimeClient(stub_config()) as prime:
+            assert await prime.ask("CONTINUE_TEXT") == "continued answer"
+
+    async def test_quiescent_empty_boundary_does_not_capture_unrelated_activity(self):
+        """A true no-text completion returns empty before unrelated queued work."""
+        async with PrimeClient(stub_config()) as prime:
+            assert await prime.ask("CONTINUE_UNRELATED") == ""
+
+    async def test_unreadable_state_at_empty_boundary_is_explicit(self):
+        async with PrimeClient(stub_config()) as prime:
+            with pytest.raises(PrimeError, match="completion state"):
+                await prime.ask("STATE_ERROR")
+
 
 class TestFraming:
     async def test_unicode_line_separators_survive(self):

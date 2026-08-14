@@ -18,6 +18,21 @@ def emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
+QUIET_STATE = {
+    "isStreaming": False,
+    "isCompacting": False,
+    "isBashRunning": False,
+    "isRunningTools": False,
+    "queuedActionCount": 0,
+    "unfinishedActionCount": 0,
+    "sessionActions": {"queuedCount": 0, "steering": [], "followUps": []},
+}
+
+# Set by continue scenarios once their intermediate boundary has been emitted;
+# the bridge's get_state query at that boundary must see runnable work.
+STATE: dict | None = None
+
+
 def assistant(text: str) -> dict:
     return {
         "role": "assistant",
@@ -27,6 +42,32 @@ def assistant(text: str) -> dict:
 
 
 def handle(command: dict) -> None:
+    if command.get("type") == "get_state":
+        # Continue scenarios update this after their first boundary. All other
+        # prompts are answered before a state query exists, so the default is
+        # the quiet state that makes a true empty completion stay empty.
+        if STATE == "ERROR":
+            emit(
+                {
+                    "id": command.get("id"),
+                    "type": "response",
+                    "command": "get_state",
+                    "success": False,
+                    "error": "stubbed state failure",
+                }
+            )
+        else:
+            emit(
+                {
+                    "id": command.get("id"),
+                    "type": "response",
+                    "command": "get_state",
+                    "success": True,
+                    "data": STATE if STATE is not None else QUIET_STATE,
+                }
+            )
+        return
+
     if command.get("type") != "prompt":
         emit({"id": command.get("id"), "type": "response", "command": command.get("type"), "success": True})
         return
@@ -83,6 +124,70 @@ def handle(command: dict) -> None:
             }
         )
         emit({"type": "agent_end", "messages": []})
+        return
+
+    if message == "CONTINUE_TEXT":
+        # Production regression shape: a tool-only root boundary whose state
+        # still has queued follow-up work, then a second root cycle with prose.
+        global STATE
+        emit(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "checking state"},
+                        {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {}},
+                    ],
+                    "stopReason": "toolUse",
+                },
+            }
+        )
+        emit({"type": "agent_end", "messages": []})
+        STATE = {
+            **QUIET_STATE,
+            "unfinishedActionCount": 1,
+            "sessionActions": {
+                "queuedCount": 1,
+                "steering": [],
+                "followUps": [{"label": "continue"}],
+            },
+        }
+        emit({"type": "agent_start"})
+        final = assistant("continued answer")
+        STATE = QUIET_STATE
+        emit({"type": "message_end", "message": final})
+        emit({"type": "agent_end", "messages": [final]})
+        return
+
+    if message == "CONTINUE_UNRELATED":
+        # Empty boundary, then a follow-up cycle that belongs to other session
+        # work. State correlation cannot prove ownership in RPC 0.7.1; after a
+        # demonstrably quiescent boundary the answer is still the local empty
+        # one rather than the unrelated prose.
+        global STATE
+        emit({"type": "agent_end", "messages": []})
+        STATE = {
+            **QUIET_STATE,
+            "unfinishedActionCount": 1,
+            "sessionActions": {
+                "queuedCount": 1,
+                "steering": [],
+                "followUps": [{"label": "someone else's continuation"}],
+            },
+        }
+        emit({"type": "agent_start"})
+        unrelated = assistant("unrelated answer")
+        STATE = QUIET_STATE
+        emit({"type": "message_end", "message": unrelated})
+        emit({"type": "agent_end", "messages": [unrelated]})
+        return
+
+    if message == "STATE_ERROR":
+        # Empty boundary, but state cannot be read: fail explicitly rather
+        # than publishing an empty answer that might be premature.
+        emit({"type": "agent_end", "messages": []})
+        STATE = "ERROR"
         return
 
     if message == "MULTIPART":
