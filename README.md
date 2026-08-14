@@ -218,6 +218,16 @@ Messages arriving while Prime is answering are polled immediately and form the
 next conversation batch; one scheduler and one worker bound task growth even
 when many conversations are active.
 
+A turn can also end without any assistant prose: a tool-only `agent_end` is a
+valid RPC boundary, and in a busy session a queued action may start another
+root cycle right behind it. On such an empty boundary the bridge consults
+`get_state` before answering: while the session is still streaming or has
+unfinished actions it keeps reading and returns the eventual prose; a
+demonstrably quiescent boundary returns the empty answer, and a state that
+cannot be read at all is surfaced as an error rather than a possibly premature
+empty reply. Queued follow-ups alone are not treated as continuation — without
+prompt correlation in the RPC event stream they may belong to other work.
+
 If the agent dies, the next message restarts it. Failures are reported into the
 Zulip conversation instead of killing the listener, because a bridge that dies
 quietly on one bad turn is indistinguishable from one that was never running.

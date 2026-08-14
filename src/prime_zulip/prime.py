@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import shutil
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -139,6 +140,7 @@ class PrimeClient:
         self.config = config or PrimeConfig()
         self._proc: asyncio.subprocess.Process | None = None
         self._events: asyncio.Queue[dict[str, Any]] | None = None
+        self._held: deque[dict[str, Any]] = deque()
         self._pump: asyncio.Task[None] | None = None
         self._stderr_pump: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -186,6 +188,7 @@ class PrimeClient:
             raise PrimeError(f"could not start prime-agent: {exc}") from exc
 
         self._events = asyncio.Queue()
+        self._held = deque()
         self._pump = asyncio.create_task(self._read_stdout(), name="prime-stdout")
         self._stderr_pump = asyncio.create_task(self._read_stderr(), name="prime-stderr")
 
@@ -260,20 +263,10 @@ class PrimeClient:
 
         parts: list[str] = []
         deadline = asyncio.get_running_loop().time() + self.config.response_timeout
+        query_counter = 0
 
         while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise PrimeError(
-                    f"prime-agent did not finish within {self.config.response_timeout:.0f}s"
-                )
-
-            try:
-                event = await asyncio.wait_for(self._events.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise PrimeError(
-                    f"prime-agent did not finish within {self.config.response_timeout:.0f}s"
-                ) from None
+            event = await self._next_event(deadline)
 
             if event is _EOF:
                 raise PrimeError("prime-agent exited before answering")
@@ -294,13 +287,97 @@ class PrimeClient:
                 parts.extend(_assistant_text(event.get("message")))
                 continue
 
-            if kind == "agent_end":
-                # Prefer the terminal summary when it carries messages: it is
-                # the authoritative list for the run, and using it avoids
-                # double-counting a message we already saw end.
-                summary = _messages_text(event.get("messages"))
-                text = summary if summary else "\n\n".join(p for p in parts if p)
-                return text.strip()
+            if kind != "agent_end":
+                continue
+
+            # Prefer the terminal summary when it carries messages: it is
+            # the authoritative list for the run, and using it avoids
+            # double-counting a message we already saw end.
+            summary = _messages_text(event.get("messages"))
+            text = (summary if summary else "\n\n".join(p for p in parts if p)).strip()
+            logger.info(
+                "prime-agent request %s reached %s with %d assistant text chars",
+                request_id,
+                kind,
+                len(text),
+            )
+            if text:
+                return text
+
+            query_counter += 1
+            state_id = f"{request_id}-state-{query_counter}"
+            state = await self._query_state(state_id, deadline)
+            continuation = _has_continuation(state)
+            logger.info(
+                "prime-agent request %s had an empty %s; state %s",
+                request_id,
+                kind,
+                _state_brief(state),
+            )
+            if continuation is True:
+                continue
+            if continuation is False:
+                return ""
+            raise PrimeError(
+                "prime-agent reached an empty agent_end, but its completion state "
+                "could not be read"
+            )
+
+    async def _next_event(self, deadline: float) -> dict[str, Any]:
+        assert self._events is not None
+        if self._held:
+            # Parked while a get_state answer was in flight; replay in
+            # receive order before anything newer from the stream. popleft()
+            # keeps draining O(1) per event instead of list.pop(0)'s O(n).
+            return self._held.popleft()
+        return await self._queued_event(deadline)
+
+    async def _queued_event(self, deadline: float) -> dict[str, Any]:
+        assert self._events is not None
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise PrimeError(
+                f"prime-agent did not finish within {self.config.response_timeout:.0f}s"
+            )
+        try:
+            return await asyncio.wait_for(self._events.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            raise PrimeError(
+                f"prime-agent did not finish within {self.config.response_timeout:.0f}s"
+            ) from None
+
+    async def _query_state(self, request_id: str, deadline: float) -> dict[str, Any] | None:
+        """Ask the agent for its state without losing events.
+
+        Ordinary 0.7.1 RPC events carry no prompt-correlation ID, so an empty
+        ``agent_end`` is ambiguous: it can be the final quiet turn, or a
+        session-action boundary with another cycle queued immediately behind
+        it. ``get_state`` is the only exposed discriminator. Events received
+        while that response is in flight are parked on ``self._held`` and
+        replayed first by ``_next_event``. The stdout pump keeps writing to
+        the one queue it bound at start, so events that arrive after the
+        state answer stay visible to this same run.
+        """
+        try:
+            await asyncio.wait_for(
+                self._send({"id": request_id, "type": "get_state"}),
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+        except (PrimeError, asyncio.TimeoutError):
+            return None
+
+        while True:
+            # Read the live queue only: replaying ``self._held`` here would
+            # re-park the same events forever.
+            event = await self._queued_event(deadline)
+            if event is _EOF:
+                raise PrimeError("prime-agent exited before answering")
+            if event.get("type") == "response" and event.get("id") == request_id:
+                if not event.get("success", False):
+                    return None
+                data = event.get("data")
+                return data if isinstance(data, dict) else None
+            self._held.append(event)
 
     async def _send(self, command: dict[str, Any]) -> None:
         proc = self._proc
@@ -314,6 +391,7 @@ class PrimeClient:
             raise PrimeError(f"prime-agent closed its input: {exc}") from exc
 
     def _drain(self) -> None:
+        self._held.clear()
         if self._events is None:
             return
         while True:
@@ -399,6 +477,77 @@ class PrimeClient:
 # Sentinel queued when the agent's stdout closes, so a waiting `ask` fails
 # immediately instead of sitting until its timeout.
 _EOF: dict[str, Any] = {"type": "__eof__"}
+
+
+def _has_continuation(state: dict[str, Any] | None) -> bool | None:
+    """Classify whether an empty ``agent_end`` has runnable continuation work.
+
+    ``True`` means wait for the next cycle, ``False`` means the boundary is
+    demonstrably quiet, and ``None`` means the state did not carry enough
+    information to make that call (including when ``_query_state`` could not
+    read any state at all). Queued *steering* is deliberately not a
+    continuation here: while this client holds its own lock no accepted prompt
+    of ours is streaming to be steered, so unrelated steering cannot become
+    this answer.
+    """
+    if not isinstance(state, dict):
+        return None
+    if (
+        state.get("isStreaming") is True
+        or state.get("isCompacting") is True
+        or state.get("isBashRunning") is True
+        or state.get("isRunningTools") is True
+    ):
+        return True
+
+    actions = state.get("sessionActions")
+    if isinstance(actions, dict):
+        active = actions.get("active")
+        if isinstance(active, dict) and active:
+            return True
+        # followUps can represent unrelated autonomous work while this client has
+        # exclusive prompt lock; they are not reliable evidence that this ask is
+        # not finished.
+
+    try:
+        unfinished = int(state.get("unfinishedActionCount", 0))
+    except (TypeError, ValueError):
+        return None
+    if unfinished > 0:
+        return True
+
+    # isStreaming=false with no unfinished actions is a quiescent
+    # boundary even when the server omits optional booleans such as
+    # isCompacting.
+    if state.get("isStreaming") is False:
+        return False
+    return None
+
+
+def _state_brief(state: dict[str, Any] | None) -> str:
+    """Content-safe state summary for logs: booleans/counts only, no prompts."""
+    if not isinstance(state, dict):
+        return "unavailable"
+    actions = state.get("sessionActions")
+    active = actions.get("active") if isinstance(actions, dict) else None
+    try:
+        followups = len(actions.get("followUps") or []) if isinstance(actions, dict) else 0
+    except TypeError:
+        followups = 0
+    return (
+        "isStreaming=%r isCompacting=%r isBashRunning=%r isRunningTools=%r "
+        "queuedActionCount=%r unfinishedActionCount=%r followUps=%d active=%s"
+        % (
+            state.get("isStreaming"),
+            state.get("isCompacting"),
+            state.get("isBashRunning"),
+            state.get("isRunningTools"),
+            state.get("queuedActionCount"),
+            state.get("unfinishedActionCount"),
+            followups,
+            "yes" if isinstance(active, dict) and active else "no",
+        )
+    )
 
 
 def _assistant_text(message: Any) -> list[str]:
