@@ -43,7 +43,7 @@ DEFAULT_RESPONSE_TIMEOUT = 600.0
 # under the same lock every later prompt queues on.
 DEFAULT_SEND_TIMEOUT = 30.0
 
-# Default streamingBehaviour for prompts: a prompt that lands while the agent
+# Default streamingBehavior for prompts: a prompt that lands while the agent
 # is still streaming an earlier answer is queued as a follow-up rather than
 # rejected. "followUp" (not "steer") matches the bridge's one-turn-at-a-time
 # serialisation: the follow-up runs only after the current turn fully stops.

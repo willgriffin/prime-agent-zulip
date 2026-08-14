@@ -35,6 +35,19 @@ def _env_float(name: str, default: float) -> float:
     return value
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {raw!r}")
+    return value
+
+
 def _env_config() -> dict[str, Any]:
     """Load bridge config from environment variables and config file."""
     # Try config file first
@@ -82,6 +95,7 @@ def _env_config() -> dict[str, Any]:
         "home_dm_user": home_dm_user,
         "debounce_seconds": _env_float("PRIME_ZULIP_DEBOUNCE_SECONDS", 5.0),
         "max_wait_seconds": _env_float("PRIME_ZULIP_DEBOUNCE_MAX_WAIT_SECONDS", 20.0),
+        "seen_messages_limit": _env_int("PRIME_ZULIP_SEEN_MESSAGES_LIMIT", 4096),
     }
 
 
@@ -109,6 +123,7 @@ async def _cmd_listen() -> None:
         RelayConfig(
             debounce_seconds=config["debounce_seconds"],
             max_wait_seconds=config["max_wait_seconds"],
+            seen_messages_limit=config["seen_messages_limit"],
         ),
     )
     print(f"Connecting to {config['site']} as {config['email']}...")

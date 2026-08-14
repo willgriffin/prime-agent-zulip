@@ -217,3 +217,80 @@ def test_batch_group_dm_labels_speakers_and_preserves_order() -> None:
     second = replace(first, message_id=2, sender_id=11, sender_full_name="User 11", content="second")
     prompt = format_batch([first, second])
     assert prompt.index("User 10:\nfirst") < prompt.index("User 11:\nsecond")
+
+
+@pytest.mark.asyncio
+async def test_disabled_mode_dispatches_each_message_during_inflight_ask() -> None:
+    bridge, prime = FakeBridge(), FakePrime()
+    prime.release = asyncio.Event()
+    relay = BurstRelay(bridge, prime, RelayConfig(0, 0))
+    try:
+        await relay.record(message_event(1))
+        await settle()
+        assert prime.prompts == ["m1"]
+        # Messages 2 and 3 arrive while ask 1 is blocked. Each must later
+        # dispatch as its own one-message turn, never one combined prompt.
+        await relay.record(message_event(2))
+        await relay.record(message_event(3))
+        await settle()
+        assert len(prime.prompts) == 1
+        prime.release.set()
+        await settle()
+        assert prime.prompts == ["m1", "m2", "m3"]
+        assert prime.max_active == 1
+    finally:
+        await relay.close()
+
+
+@pytest.mark.asyncio
+async def test_seen_messages_bounded_and_recent_wins() -> None:
+    bridge, prime = FakeBridge(), FakePrime()
+    relay = BurstRelay(bridge, prime, RelayConfig(0, 0, seen_messages_limit=3))
+    try:
+        for i in range(3):
+            await relay.record(message_event(i + 1))
+            await settle()
+        assert len(relay._seen_messages) == 3
+        # A replay of a still-recent id is still deduped.
+        await relay.record(message_event(2))
+        await settle()
+        assert len(relay._seen_messages) == 3
+        # Inserting beyond the cap evicts the least recently used id (1);
+        # the replay of 2 made 1 the oldest entry.
+        await relay.record(message_event(4))
+        assert 1 not in relay._seen_messages
+        assert sorted(relay._seen_messages) == [2, 3, 4]
+        # Id 1 fell off the window, so a replay is treated as new traffic.
+        await relay.record(message_event(1))
+        await settle()
+        assert prime.prompts.count("m1") == 2
+    finally:
+        await relay.close()
+
+
+@pytest.mark.asyncio
+async def test_typing_stop_attempted_when_worker_cancelled_during_typing_start() -> None:
+    bridge, prime = HangingTypingStartBridge(), FakePrime()
+    relay = BurstRelay(bridge, prime, RelayConfig(0, 0))
+    try:
+        await relay.record(message_event(1))
+        await settle()
+        assert bridge.started
+    finally:
+        # close() cancels the worker while it is parked on typing_start.
+        await relay.close()
+    assert bridge.stopped
+    assert bridge.typing == [("stop", "dm:10,99")]
+
+
+class HangingTypingStartBridge(FakeBridge):
+    started = False
+    stopped = False
+
+    async def typing_start(self, chat_id: str, metadata: Any = None) -> None:
+        self.started = True
+        await asyncio.Event().wait()
+
+    async def typing_stop(self, chat_id: str, metadata: Any = None) -> None:
+        self.stopped = True
+        self.typing.append(("stop", chat_id))

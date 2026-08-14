@@ -71,7 +71,9 @@ Typing start/repeat extends that quiet period only when a message is already
 pending; typing stop resumes it, and a hard 20-second cap prevents a missing
 stop event from starving the turn. Typing notifications by themselves never
 invoke Prime. Set `PRIME_ZULIP_DEBOUNCE_SECONDS=0` to restore immediate
-one-message behavior.
+one-message behavior: each message becomes its own Prime turn, including
+messages that pile up while a previous turn is still in flight (they are
+dispatched one by one, not collapsed into one combined prompt).
 
 Batching is at-most-once and in-memory: a process restart discards pending
 fragments rather than replaying old ones, and a Zulip queue re-registration
@@ -185,6 +187,7 @@ no bypass.
 | `PRIME_AGENT_STREAMING_BEHAVIOR` | No | `streamingBehavior` sent on prompts: `followUp` (default; queue a prompt racing an in-flight stream as a follow-up), `steer`, or empty to disable |
 | `PRIME_ZULIP_DEBOUNCE_SECONDS` | No | Quiet time before dispatch; non-negative seconds, default `5`, `0` disables batching |
 | `PRIME_ZULIP_DEBOUNCE_MAX_WAIT_SECONDS` | No | Hard cap from the first message; non-negative seconds, default `20`; values below quiet time are raised to it |
+| `PRIME_ZULIP_SEEN_MESSAGES_LIMIT` | No | Dedupe memory bound: most recent message ids kept, default `4096`; a replayed id is re-delivered once it falls off this window |
 
 No credential is ever placed in the agent's argv — argv is world-readable via
 `/proc`. What the agent needs reaches it through the inherited environment.

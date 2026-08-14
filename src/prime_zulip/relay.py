@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -23,10 +23,13 @@ class RelayConfig:
 
     debounce_seconds: float = 5.0
     max_wait_seconds: float = 20.0
+    seen_messages_limit: int = 4096
 
     def __post_init__(self) -> None:
         if self.debounce_seconds < 0 or self.max_wait_seconds < 0:
             raise ValueError("debounce timings must be non-negative")
+        if self.seen_messages_limit < 1:
+            raise ValueError("seen_messages_limit must be at least 1")
         if self.debounce_seconds == 0:
             object.__setattr__(self, "max_wait_seconds", 0.0)
         elif self.max_wait_seconds < self.debounce_seconds:
@@ -70,7 +73,10 @@ class BurstRelay:
         self._clock = clock
         self._pending: dict[str, _PendingBatch] = {}
         self._ready: deque[_ReadyBatch] = deque()
-        self._seen_messages: set[int] = set()
+        # LRU-bounded so a long-lived bridge does not leak message ids; a
+        # replayed id only needs to stay known until the queue could still
+        # redeliver it, which is minutes, not process lifetime.
+        self._seen_messages: OrderedDict[int, None] = OrderedDict()
         self._condition = asyncio.Condition()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
@@ -147,8 +153,11 @@ class BurstRelay:
 
     def _record_message(self, message: ZulipMessage, event_id: int | None) -> None:
         if message.message_id in self._seen_messages:
+            self._seen_messages.move_to_end(message.message_id)
             return
-        self._seen_messages.add(message.message_id)
+        self._seen_messages[message.message_id] = None
+        while len(self._seen_messages) > self.config.seen_messages_limit:
+            self._seen_messages.popitem(last=False)
         now = self._now()
         batch = self._pending.get(message.chat_id)
         if batch is None:
@@ -204,7 +213,17 @@ class BurstRelay:
                             key=lambda item: (item[0], item[1].message_id),
                         )
                     ]
-                    if ordered:
+                    if not ordered:
+                        continue
+                    if self.config.debounce_seconds == 0:
+                        # Disabled mode documents immediate one-message turns:
+                        # a burst that accumulated while this chat's ask was
+                        # in flight must not collapse into one combined prompt.
+                        # Queue one ready entry per message, in order, so each
+                        # becomes its own Prime turn.
+                        for item in ordered:
+                            self._ready.append(_ReadyBatch(key, [item]))
+                    else:
                         self._ready.append(_ReadyBatch(key, ordered))
                 if due:
                     self._condition.notify_all()
@@ -247,25 +266,49 @@ class BurstRelay:
     async def _relay_batch(self, messages: list[ZulipMessage]) -> None:
         last = messages[-1]
         prompt = format_batch(messages)
-        print(f"\n[{last.sender_full_name}] {prompt[:200]}")
-        await self.bridge.typing_start(last.chat_id, last.metadata)
-        pinger = asyncio.create_task(
-            _typing_pinger(self.bridge, last.chat_id, last.metadata),
-            name="zulip-outbound-typing",
+        # Content-free: conversation text must not leak into terminal/logs.
+        logger.info(
+            "relaying prompt to prime: chat=%s messages=%d last_sender=%s prompt_len=%d",
+            last.chat_id,
+            len(messages),
+            last.sender_full_name or last.sender_email,
+            len(prompt),
         )
+        current = asyncio.current_task()
         try:
-            answer = await self.prime.ask(prompt)
-        except PrimeError as exc:
-            logger.error("prime-agent failed: %s", exc)
-            answer = f":warning: prime-agent could not answer: {exc}"
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("unexpected relay failure")
-            answer = f":warning: bridge error: {exc}"
+            await self.bridge.typing_start(last.chat_id, last.metadata)
+            pinger = asyncio.create_task(
+                _typing_pinger(self.bridge, last.chat_id, last.metadata),
+                name="zulip-outbound-typing",
+            )
+            try:
+                answer = await self.prime.ask(prompt)
+            except PrimeError as exc:
+                logger.error("prime-agent failed: %s", exc)
+                answer = f":warning: prime-agent could not answer: {exc}"
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("unexpected relay failure")
+                answer = f":warning: bridge error: {exc}"
+            finally:
+                pinger.cancel()
+                try:
+                    await pinger
+                except asyncio.CancelledError:
+                    # Awaiting the just-cancelled pinger raises its
+                    # cancellation; only swallow that, never the worker's
+                    # own, or close() could never collect this task.
+                    if current is None or current.cancelling() == 0:
+                        pass
+                    else:
+                        raise
         finally:
-            pinger.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pinger
-            await self.bridge.typing_stop(last.chat_id, last.metadata)
+            # Runs even when the worker is cancelled mid-typing_start: an
+            # indicator left "on" pins the whole conversation's UI, while a
+            # stop after a start that never landed is harmless. suppress
+            # (not Exception) never swallows a pending cancellation, and a
+            # failing stop must not mask the original exception either.
+            with contextlib.suppress(Exception):
+                await self.bridge.typing_stop(last.chat_id, last.metadata)
 
         if not answer.strip():
             answer = "_(prime-agent finished without a text response)_"
