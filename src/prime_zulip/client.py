@@ -76,7 +76,10 @@ class ZulipClient:
                 "event_types": json.dumps(types),
                 "apply_markdown": "false",
                 "client_capabilities": json.dumps(
-                    {"stream_typing_notifications": True}
+                    {
+                        "stream_typing_notifications": True,
+                        "notification_settings_null": True,
+                    }
                 ),
             },
         )
