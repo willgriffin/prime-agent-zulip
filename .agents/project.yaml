@@ -1,0 +1,43 @@
+{
+  "schema": "https://happyvertical.com/schemas/agent-project/v1",
+  "policy": {
+    "profile": "personal",
+    "revision": "1.0.0"
+  },
+  "tracker": {
+    "provider": "github",
+    "repository": "willgriffin/prime-agent-zulip",
+    "project_url": null
+  },
+  "forge": {
+    "provider": "github",
+    "repository": "willgriffin/prime-agent-zulip"
+  },
+  "labels": {
+    "claim": "agent: implementation",
+    "blocked": "status: blocked",
+    "dispatch": {
+      "claude": "dispatch: claude",
+      "codex": "dispatch: codex",
+      "hermes": "dispatch: hermes",
+      "jcode": "dispatch: jcode",
+      "kimi": "dispatch: kimi",
+      "zcode": "dispatch: zcode"
+    }
+  },
+  "memory": {
+    "provider": "hindsight",
+    "bank": "repo-willgriffin-prime-agent-zulip",
+    "package_tags": []
+  },
+  "instructions": {
+    "canonical": "AGENTS.md",
+    "adapters": []
+  },
+  "skills": {
+    "paths": []
+  },
+  "runtime": {
+    "agent_lifecycle_stage": "compatibility"
+  }
+}
