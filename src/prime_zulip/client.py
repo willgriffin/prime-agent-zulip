@@ -312,7 +312,12 @@ class ZulipClient:
                 payload = {}
 
             code = str(payload.get("code", "")).upper()
-            if code == "BAD_EVENT_QUEUE_ID":
+            msg = str(payload.get("msg", "")).lower()
+            # Zulip 12 reports a queue whose requested event id is no longer
+            # available as HTTP 400 BAD_REQUEST "Event N was not in this
+            # queue", not as BAD_EVENT_QUEUE_ID. Both mean the client must
+            # re-register, so collapse them here.
+            if code == "BAD_EVENT_QUEUE_ID" or "not in this queue" in msg:
                 raise BadEventQueueError(
                     payload.get("msg") or "BAD_EVENT_QUEUE_ID",
                     payload,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from typing import Any
 
 from prime_zulip.client import ZulipClient
@@ -30,3 +32,22 @@ async def test_register_queue_declares_zulip12_capabilities(monkeypatch):
     capabilities = json.loads(captured["data"]["client_capabilities"])
     assert capabilities["notification_settings_null"] is True
     assert capabilities["stream_typing_notifications"] is True
+
+
+def test_raise_for_status_treats_stale_event_as_bad_queue():
+    """Zulip 12 returns BAD_REQUEST "Event N was not in this queue" when the
+    queue no longer holds the requested event id. The poll loop must see this
+    as a queue-expiry so it re-registers instead of looping."""
+    import httpx
+
+    from prime_zulip.client import BadEventQueueError, ZulipClient
+
+    request = httpx.Request("GET", "https://zulip.example.com/api/v1/events")
+    resp = httpx.Response(
+        400,
+        json={"result": "error", "msg": "Event 193 was not in this queue", "code": "BAD_REQUEST"},
+        request=request,
+    )
+
+    with pytest.raises(BadEventQueueError):
+        ZulipClient._raise_for_status(resp)
