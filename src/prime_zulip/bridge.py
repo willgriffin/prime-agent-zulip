@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 POLL_ERROR_SLEEP = 5.0
 
+# Pause after a queue re-register attempt before polling again. Re-registering
+# replaces the queue; if it just failed (rate limit, 5xx) the stale queue is
+# still in place and an immediate poll repeats the same failure.
+REREGISTER_BACKOFF_SECONDS = 2.0
+
 
 @dataclass
 class BridgeConfig:
@@ -405,6 +410,10 @@ class PrimeZulipBridge:
         except BadEventQueueError:
             logger.warning("Zulip event queue expired — re-registering")
             await self._reregister_queue()
+            # A re-register that fails (rate limit, 5xx) leaves the stale
+            # queue in place; polling again immediately just re-raises the
+            # same error and spins. Back off before the next attempt.
+            await asyncio.sleep(REREGISTER_BACKOFF_SECONDS)
             return
 
         if payload.get("result") == "error":
@@ -449,9 +458,13 @@ class PrimeZulipBridge:
                 await self._event_queue.put(ZulipEvent(type="queue_reset"))
             queue_data = await self._client.register_queue()
             self._queue_id = queue_data["queue_id"]
-            self._last_event_id = max(
-                int(queue_data.get("last_event_id", -1)), self._last_event_id
-            )
+            # Event ids are queue-local: the new queue numbers its events
+            # from its own last_event_id, so the previous queue's watermark
+            # must NOT carry over. Keeping it (max()) made every post-
+            # recovery poll ask the fresh queue for an id it does not hold,
+            # returning "Event N was not in this queue" and re-registering
+            # forever (#23).
+            self._last_event_id = int(queue_data.get("last_event_id", -1))
             logger.info("Zulip bridge re-registered queue %s", self._queue_id)
         except Exception as exc:
             logger.error("Zulip bridge failed to re-register queue: %s", exc)
